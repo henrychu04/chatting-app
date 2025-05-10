@@ -1,0 +1,10 @@
+{
+  "out": "./migrations",
+  "schema": "./src/db/schema.ts",
+  "driver": "d1",
+  "dbCredentials": {
+    "dbName": "chat_db"
+  },
+  "verbose": true,
+  "strict": true
+}
