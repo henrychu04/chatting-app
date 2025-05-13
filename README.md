@@ -78,7 +78,6 @@ npm run worker:deploy
 ## Project Structure
 
 ```
-├── app/              # React Router 7 app directory
 ├── src/
 │   ├── components/   # React components
 │   ├── hooks/        # Custom React hooks
