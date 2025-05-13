@@ -1,280 +1,255 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import {
+  WebSocketMessage,
+  BatchMessage,
+  WS_MESSAGE_TYPES,
+  WebSocketMessageType,
+  ConnectionCountMessage,
+  ConnectionStatusMessage,
+  ErrorMessage,
+  MessageHistoryMessage,
+} from '../types/websocket';
+import { useAuth } from '../contexts/AuthContext';
 
-interface WebSocketMessage {
-  type: string;
+interface Message {
   content: string;
   user: string;
   timestamp: number;
-  id?: string;
-  message?: string; // For server message format
-}
-
-interface ServerMessage {
-  message: string;
-  user: string;
-  timestamp: number;
   id: string;
 }
 
-interface BatchMessage {
-  message?: string;
-  content?: string;
-  user: string;
-  timestamp: number;
-  id: string;
-}
-
-interface WebSocketHookProps {
-  roomId: string;
-  authToken?: string;
-  userId?: string;
-  username?: string;
-}
-
-interface WebSocketHookResult {
-  messages: WebSocketMessage[];
-  sendMessage: (content: string) => void;
-  sendBatchMessage: (contents: string[]) => void;
-  error: string | null;
-  isConnected: boolean;
-  connectedUsers: number;
-}
-
-export function useWebSocket({ roomId, authToken, userId, username }: WebSocketHookProps): WebSocketHookResult {
-  const [messages, setMessages] = useState<WebSocketMessage[]>([]);
-  const [error, setError] = useState<string | null>(null);
+export function useWebSocket(roomId: string) {
+  const [messages, setMessages] = useState<Message[]>([]);
   const [isConnected, setIsConnected] = useState(false);
-  const [ws, setWs] = useState<WebSocket | null>(null);
-  const [connectedUsers, setConnectedUsers] = useState(0);
-  const [hasRequestedHistory, setHasRequestedHistory] = useState(false);
+  const [connectionCount, setConnectionCount] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const ws = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
+  const isConnectingRef = useRef(false);
+  const { authToken, userId, username } = useAuth();
 
-  const connect = useCallback(() => {
-    // Clear any existing reconnect timeout
+  const cleanup = useCallback(() => {
     if (reconnectTimeoutRef.current) {
-      window.clearTimeout(reconnectTimeoutRef.current);
+      clearTimeout(reconnectTimeoutRef.current);
       reconnectTimeoutRef.current = null;
     }
-
-    // Only close existing connection if it's not already closed
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      console.log('Closing existing WebSocket connection');
-      ws.close();
+    if (ws.current) {
+      ws.current.onclose = null;
+      ws.current.onerror = null;
+      ws.current.onmessage = null;
+      ws.current.onopen = null;
+      if (ws.current.readyState === WebSocket.OPEN || ws.current.readyState === WebSocket.CONNECTING) {
+        ws.current.close();
+      }
+      ws.current = null;
     }
-
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/${roomId}`;
-    console.log('Connecting to WebSocket:', wsUrl);
-    const socket = new WebSocket(wsUrl);
-
-    socket.onopen = () => {
-      console.log('WebSocket connection established');
-      setIsConnected(true);
-      setError(null);
-
-      // Send authentication message
-      if (authToken && userId && username) {
-        const authMessage = {
-          type: 'auth',
-          authToken,
-          userId,
-          username,
-        };
-        console.log('Sending authentication:', authMessage);
-        socket.send(JSON.stringify(authMessage));
-      }
-
-      // Request message history only if we haven't requested it before
-      if (authToken && !hasRequestedHistory) {
-        const historyRequest = {
-          type: 'get_history',
-          authToken,
-          userId,
-          username,
-        };
-        console.log('Requesting message history:', historyRequest);
-        socket.send(JSON.stringify(historyRequest));
-        setHasRequestedHistory(true);
-      }
-    };
-
-    socket.onclose = (event) => {
-      console.log('WebSocket connection closed:', event.code, event.reason);
-      setIsConnected(false);
-
-      // Only attempt to reconnect if we have an auth token and the connection wasn't closed cleanly
-      if (authToken && !event.wasClean) {
-        console.log('Attempting to reconnect...');
-        reconnectTimeoutRef.current = window.setTimeout(connect, 3000);
-      }
-    };
-
-    socket.onerror = (event) => {
-      console.error('WebSocket error:', event);
-      setError('WebSocket connection error');
-      setIsConnected(false);
-    };
-
-    socket.onmessage = (event) => {
-      try {
-        console.log('Received message:', event.data);
-        const data = JSON.parse(event.data);
-        let newMessages: WebSocketMessage[] = [];
-
-        switch (data.type) {
-          case 'message':
-            // Handle both client and server message formats
-            newMessages = [
-              {
-                type: 'message',
-                content: data.content || data.message,
-                user: data.user,
-                timestamp: data.timestamp,
-                id: data.id,
-              },
-            ];
-            setMessages((prev) => [...prev, ...newMessages]);
-            break;
-          case 'message_batch':
-            // Convert server message format to client format
-            newMessages = data.messages.map((msg: BatchMessage) => ({
-              type: 'message',
-              content: msg.message || msg.content,
-              user: msg.user,
-              timestamp: msg.timestamp,
-              id: msg.id,
-            }));
-            setMessages((prev) => [...prev, ...newMessages]);
-            break;
-          case 'error':
-            setError(data.message);
-            break;
-          case 'connection_count':
-          case 'connection_status':
-            setConnectedUsers(data.count || data.connectionCount || 0);
-            break;
-          case 'message_history': {
-            console.log('Received message history:', data.messages);
-            // Convert server message format to client format
-            const historyMessages = (data.messages as ServerMessage[]).map((msg) => ({
-              type: 'message',
-              content: msg.message,
-              user: msg.user,
-              timestamp: msg.timestamp,
-              id: msg.id,
-            }));
-            setMessages(historyMessages);
-            break;
-          }
-          default:
-            console.log('Unknown message type:', data.type);
-        }
-      } catch (err) {
-        console.error('Failed to parse message:', err);
-        setError('Failed to parse message');
-      }
-    };
-
-    setWs(socket);
-  }, [roomId, authToken, userId, username]);
-
-  // Reset hasRequestedHistory when auth token changes
-  useEffect(() => {
-    setHasRequestedHistory(false);
-  }, [authToken]);
-
-  // Initial connection and reconnection on auth token change
-  useEffect(() => {
-    if (authToken) {
-      console.log('Auth token changed, reconnecting...');
-      connect();
-    }
-    return () => {
-      if (reconnectTimeoutRef.current) {
-        window.clearTimeout(reconnectTimeoutRef.current);
-      }
-    };
-  }, [authToken, connect]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (reconnectTimeoutRef.current) {
-        window.clearTimeout(reconnectTimeoutRef.current);
-      }
-      if (ws) {
-        console.log('Cleaning up WebSocket connection');
-        ws.close();
-      }
-    };
+    isConnectingRef.current = false;
   }, []);
+
+  const connect = useCallback(() => {
+    // Prevent multiple connection attempts
+    if (ws.current?.readyState === WebSocket.OPEN || isConnectingRef.current) {
+      console.log('WebSocket already connected or connecting');
+      return;
+    }
+
+    // Clean up any existing connection
+    cleanup();
+
+    try {
+      isConnectingRef.current = true;
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${location.host}/ws/${roomId}`;
+      console.log('Connecting to WebSocket:', wsUrl);
+      const socket = new WebSocket(wsUrl);
+
+      socket.onopen = () => {
+        console.log('WebSocket connected');
+        setIsConnected(true);
+        setError(null);
+        isConnectingRef.current = false;
+
+        // Send authentication message if we have a token
+        if (authToken && userId && username) {
+          const authMessage = {
+            type: WS_MESSAGE_TYPES.AUTH,
+            authToken,
+            userId,
+            username,
+          };
+          socket.send(JSON.stringify(authMessage));
+
+          // Request message history only after sending auth
+          const historyMessage = {
+            type: WS_MESSAGE_TYPES.GET_HISTORY,
+            roomId,
+            authToken,
+            userId,
+            username,
+          };
+          socket.send(JSON.stringify(historyMessage));
+        }
+      };
+
+      socket.onclose = (event) => {
+        console.log('WebSocket closed:', event.code, event.reason);
+        setIsConnected(false);
+        isConnectingRef.current = false;
+        ws.current = null;
+
+        // Only attempt to reconnect if the connection was closed unexpectedly
+        if (event.code !== 1000 && !reconnectTimeoutRef.current) {
+          console.log('Attempting to reconnect...');
+          reconnectTimeoutRef.current = window.setTimeout(() => {
+            reconnectTimeoutRef.current = null;
+            connect();
+          }, 3000);
+        }
+      };
+
+      socket.onerror = (event) => {
+        console.error('WebSocket error:', event);
+        setError('Connection error. Please try again.');
+        isConnectingRef.current = false;
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data) as WebSocketMessageType;
+          console.log('Received raw message:', event.data);
+          console.log('Parsed message:', message);
+
+          if (!message.type) {
+            console.error('Message missing type:', message);
+            return;
+          }
+
+          let statusMessage: ConnectionStatusMessage;
+          switch (message.type) {
+            case WS_MESSAGE_TYPES.AUTH_SUCCESS:
+              console.log('Authentication successful:', message);
+              break;
+            case WS_MESSAGE_TYPES.MESSAGE:
+              setMessages((prev) => [
+                ...prev,
+                {
+                  content: message.content || message.message || '',
+                  user: message.user,
+                  timestamp: message.timestamp,
+                  id: message.id,
+                },
+              ]);
+              break;
+            case WS_MESSAGE_TYPES.MESSAGE_BATCH:
+              setMessages((prev) => [
+                ...prev,
+                ...(message as BatchMessage).messages.map((msg) => ({
+                  content: msg.content || msg.message || '',
+                  user: msg.user,
+                  timestamp: msg.timestamp,
+                  id: msg.id,
+                })),
+              ]);
+              break;
+            case WS_MESSAGE_TYPES.MESSAGE_HISTORY:
+              console.log('Received history:', message);
+              setMessages(
+                (message as MessageHistoryMessage).messages.map((msg) => ({
+                  content: msg.message || msg.content || '',
+                  user: msg.user,
+                  timestamp: msg.timestamp,
+                  id: msg.id,
+                }))
+              );
+              break;
+            case WS_MESSAGE_TYPES.CONNECTION_COUNT:
+              setConnectionCount((message as ConnectionCountMessage).count);
+              break;
+            case WS_MESSAGE_TYPES.CONNECTION_STATUS:
+              console.log('Received connection status:', message);
+              statusMessage = message as ConnectionStatusMessage;
+              setIsConnected(true);
+              setConnectionCount(statusMessage.connectionCount);
+              break;
+            case WS_MESSAGE_TYPES.ERROR:
+              setError((message as ErrorMessage).message);
+              break;
+            default:
+              console.warn('Unknown message type:', message.type);
+          }
+        } catch (err) {
+          console.error('Error parsing message:', err);
+          setError('Error processing message');
+        }
+      };
+
+      ws.current = socket;
+    } catch (err) {
+      console.error('Error creating WebSocket:', err);
+      setError('Failed to connect. Please try again.');
+      isConnectingRef.current = false;
+    }
+  }, [roomId, authToken, userId, username, cleanup]);
+
+  // Connect on mount and when auth state changes
+  useEffect(() => {
+    connect();
+    return cleanup;
+  }, [connect, cleanup]);
 
   const sendMessage = useCallback(
     (content: string) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        setError('WebSocket is not connected');
-        return;
-      }
-
-      if (!authToken || !userId || !username) {
-        setError('Authentication required to send messages');
+      if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
+        setError('Not connected to server');
         return;
       }
 
       try {
-        const message = {
-          type: 'message',
+        const message: WebSocketMessage = {
+          type: WS_MESSAGE_TYPES.MESSAGE,
           content,
-          authToken,
-          userId,
-          username,
+          user: username || 'Anonymous',
+          timestamp: Date.now(),
+          id: String(Date.now()),
         };
-        console.log('Sending message:', message);
-        ws.send(JSON.stringify(message));
+        ws.current.send(JSON.stringify(message));
       } catch (err) {
-        console.error('Failed to send message:', err);
+        console.error('Error sending message:', err);
         setError('Failed to send message');
       }
     },
-    [ws, authToken, userId, username]
+    [username]
   );
 
-  const sendBatchMessage = useCallback(
+  const sendBatchMessages = useCallback(
     (contents: string[]) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        setError('WebSocket is not connected');
+      if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
+        setError('Not connected to chat server');
         return;
       }
 
-      if (!authToken || !userId || !username) {
-        setError('Authentication required to send messages');
-        return;
-      }
-
-      try {
-        const message = {
-          type: 'message_batch',
-          authToken,
-          userId,
-          username,
-          messages: contents.map((content) => ({ content })),
-        };
-        console.log('Sending batch message:', message);
-        ws.send(JSON.stringify(message));
-      } catch (err) {
-        console.error('Failed to send batch message:', err);
-        setError('Failed to send batch message');
-      }
+      const message: BatchMessage = {
+        type: WS_MESSAGE_TYPES.MESSAGE_BATCH,
+        messages: contents.map((content) => ({
+          type: WS_MESSAGE_TYPES.MESSAGE,
+          content,
+          user: username || 'Anonymous',
+          timestamp: Date.now(),
+          id: String(Date.now() + Math.random()),
+        })),
+      };
+      console.log('Sending batch message:', message);
+      ws.current.send(JSON.stringify(message));
     },
-    [ws, authToken, userId, username]
+    [username]
   );
 
   return {
     messages,
-    sendMessage,
-    sendBatchMessage,
-    error,
     isConnected,
-    connectedUsers,
+    connectionCount,
+    error,
+    sendMessage,
+    sendBatchMessages,
   };
 }

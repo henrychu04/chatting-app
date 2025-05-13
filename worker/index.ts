@@ -1,8 +1,10 @@
 import { Auth } from './auth';
 import sanitizeHtml from 'sanitize-html';
 import { createDb } from '../src/db';
-import { rooms } from '../src/db/schema';
-import { eq } from 'drizzle-orm';
+import { rooms, messages, users } from '../src/db/schema';
+import { eq, desc } from 'drizzle-orm';
+import { WebSocketMessage, WS_MESSAGE_TYPES, WebSocketMessageType } from '../src/types/websocket';
+import { isbot } from 'isbot';
 
 export interface Env {
   WEBSOCKET_HIBERNATION_SERVER: DurableObjectNamespace;
@@ -17,7 +19,7 @@ export interface Env {
 const MAX_HISTORY = 100;
 const MAX_MESSAGE_LENGTH = 1000;
 const MAX_USERNAME_LENGTH = 30;
-const MAX_CONNECTIONS_PER_IP = 5;
+const MAX_CONNECTIONS_PER_IP = 20;
 const PING_INTERVAL = 30000; // 30 seconds
 const PONG_TIMEOUT = 10000; // 10 seconds
 const MAX_RETRY_ATTEMPTS = 3;
@@ -34,13 +36,6 @@ const sanitizeOptions = {
   allowProtocolRelative: false,
   enforceHtmlBoundary: true,
 };
-
-interface Message {
-  message: string;
-  user: string;
-  id: string;
-  timestamp: number;
-}
 
 interface ExtendedWebSocket extends WebSocket {
   clientIP: string;
@@ -177,6 +172,12 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // Check for bot traffic
+    const userAgent = request.headers.get('user-agent') || '';
+    if (isbot(userAgent)) {
+      return new Response('Bot traffic not allowed', { status: 403 });
+    }
+
     // Handle API routes
     if (path.startsWith('/api/')) {
       // Add CORS headers to API responses
@@ -193,9 +194,9 @@ export default {
     // Handle WebSocket connections
     if (path.startsWith('/ws')) {
       // Extract room ID from path or query parameter
-      let roomId = 'default';
+      let roomId = 'main';
       if (path === '/ws') {
-        roomId = url.searchParams.get('room') || 'default';
+        roomId = url.searchParams.get('room') || 'main';
       } else {
         // Handle /ws/{roomId} format
         const pathParts = path.split('/');
@@ -227,8 +228,7 @@ export default {
 };
 
 export class WebSocketHibernationServer implements DurableObject {
-  private messageHistory: Message[] = [];
-  private messageQueue: Message[] = [];
+  private messageQueue: WebSocketMessage[] = [];
   private batchTimeout: ReturnType<typeof setTimeout> | null = null;
   private userMessageCounts: Map<string, { count: number; lastReset: number }> = new Map();
   private state: DurableObjectState;
@@ -243,18 +243,6 @@ export class WebSocketHibernationServer implements DurableObject {
     this.state = state;
     this.env = env;
     this.db = createDb(env.DB);
-    this.initializeState();
-  }
-
-  private async initializeState() {
-    const stored = await this.state.storage.get('messageHistory');
-    if (stored) {
-      this.messageHistory = stored as Message[];
-    }
-  }
-
-  private async persistState() {
-    await this.state.storage.put('messageHistory', this.messageHistory);
   }
 
   private broadcast(message: string): void {
@@ -269,24 +257,27 @@ export class WebSocketHibernationServer implements DurableObject {
     });
   }
 
-  private broadcastBatch(messages: Message[]): void {
+  private broadcastBatch(messages: WebSocketMessage[]): void {
     if (messages.length === 0) return;
 
-    const batchMessage = JSON.stringify({
-      type: 'message_batch',
-      messages: messages.map((msg) => ({
-        type: 'message',
-        ...msg,
-      })),
-    });
-
-    this.broadcast(batchMessage);
+    // Send message batch to all clients
+    this.broadcast(
+      JSON.stringify({
+        type: WS_MESSAGE_TYPES.MESSAGE_BATCH,
+        messages: messages.map((msg) => ({
+          content: msg.content,
+          user: msg.user,
+          timestamp: msg.timestamp,
+          id: msg.id,
+        })),
+      })
+    );
   }
 
   private broadcastConnectionCount(): void {
     const count = this.clients.size;
     const message = JSON.stringify({
-      type: 'connection_count',
+      type: WS_MESSAGE_TYPES.CONNECTION_COUNT,
       count: count,
     });
     this.broadcast(message);
@@ -299,6 +290,39 @@ export class WebSocketHibernationServer implements DurableObject {
         lastActivity: new Date(),
       })
       .where(eq(rooms.id, roomId));
+  }
+
+  private async getMessageHistory(ws: WebSocket): Promise<void> {
+    const roomId = this.state.id.toString();
+    const recentMessages = await this.db
+      .select({
+        id: messages.id,
+        content: messages.content,
+        createdAt: messages.createdAt,
+        username: users.username,
+      })
+      .from(messages)
+      .leftJoin(users, eq(messages.userId, users.id))
+      .where(eq(messages.roomId, roomId))
+      .orderBy(desc(messages.createdAt))
+      .limit(MAX_HISTORY);
+
+    if (recentMessages.length > 0) {
+      const formattedMessages = recentMessages.map((msg) => ({
+        type: WS_MESSAGE_TYPES.MESSAGE,
+        message: msg.content,
+        user: msg.username,
+        id: msg.id,
+        timestamp: msg.createdAt,
+      }));
+
+      ws.send(
+        JSON.stringify({
+          type: WS_MESSAGE_TYPES.MESSAGE_HISTORY,
+          messages: formattedMessages,
+        })
+      );
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -323,12 +347,15 @@ export class WebSocketHibernationServer implements DurableObject {
     // Send initial connection success message with current connection count
     server.send(
       JSON.stringify({
-        type: 'connection_status',
+        type: WS_MESSAGE_TYPES.CONNECTION_STATUS,
         status: 'connected',
         message: 'Successfully connected to chat room',
         connectionCount: this.clients.size,
       })
     );
+
+    // Send message history
+    await this.getMessageHistory(server);
 
     // Broadcast updated connection count to all clients
     this.broadcastConnectionCount();
@@ -349,49 +376,55 @@ export class WebSocketHibernationServer implements DurableObject {
     }
 
     try {
-      const data = JSON.parse(message);
+      const data = JSON.parse(message) as WebSocketMessageType;
 
       // Handle authentication
-      if (data.type === 'auth') {
+      if (data.type === WS_MESSAGE_TYPES.AUTH) {
         const auth = await Auth.verifyToken(data.authToken, this.env);
         if (!auth || auth.userId !== data.userId || auth.username !== data.username) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Invalid authentication' }));
+          ws.send(JSON.stringify({ type: WS_MESSAGE_TYPES.ERROR, message: 'Invalid authentication' }));
           return;
         }
         (ws as ExtendedWebSocket).clientIP = data.userId;
-        ws.send(JSON.stringify({ type: 'auth_success', username: data.username }));
+        ws.send(JSON.stringify({ type: WS_MESSAGE_TYPES.AUTH_SUCCESS, username: data.username }));
+        return;
+      }
+
+      // Handle message history requests
+      if (data.type === WS_MESSAGE_TYPES.GET_HISTORY) {
+        await this.getMessageHistory(ws);
         return;
       }
 
       // Handle ping messages
-      if (data.type === 'ping') {
+      if (data.type === WS_MESSAGE_TYPES.PING) {
         (ws as ExtendedWebSocket).lastPing = Date.now();
-        ws.send(JSON.stringify({ type: 'pong' }));
+        ws.send(JSON.stringify({ type: WS_MESSAGE_TYPES.PONG }));
         return;
       }
 
       // Handle typing indicator
-      if (data.type === 'typing') {
+      if (data.type === WS_MESSAGE_TYPES.TYPING) {
         const username = data.user;
         this.typingUsers.set(username, Date.now());
-        this.broadcast(JSON.stringify({ type: 'typing', user: username }));
+        this.broadcast(JSON.stringify({ type: WS_MESSAGE_TYPES.TYPING, user: username }));
         return;
       }
 
       // Handle regular messages
-      if (data.type === 'message') {
-        const content = data.content || data.message;
-        const user = data.username || data.user;
+      if (data.type === WS_MESSAGE_TYPES.MESSAGE) {
+        const content = data.content;
+        const user = data.user;
 
         if (!content || !user) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Message and user are required' }));
+          ws.send(JSON.stringify({ type: WS_MESSAGE_TYPES.ERROR, message: 'Message and user are required' }));
           return;
         }
 
         const validation = validateMessage(content, user);
 
         if (!validation.valid) {
-          ws.send(JSON.stringify({ type: 'error', message: validation.error }));
+          ws.send(JSON.stringify({ type: WS_MESSAGE_TYPES.ERROR, message: validation.error }));
           return;
         }
 
@@ -403,21 +436,76 @@ export class WebSocketHibernationServer implements DurableObject {
         }
 
         if (userCount.count >= 10) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Message rate limit exceeded' }));
+          ws.send(JSON.stringify({ type: WS_MESSAGE_TYPES.ERROR, message: 'Message rate limit exceeded' }));
           return;
         }
 
         userCount.count++;
         this.userMessageCounts.set(user, userCount);
 
-        const messageId = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        const messageId = `msg-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
         const timestamp = Date.now();
+        const roomId = this.state.id.toString();
 
-        const newMessage: Message = {
-          message: content,
-          user,
+        // Ensure user exists in database
+        const existingUser = await this.db.select().from(users).where(eq(users.username, user)).limit(1);
+
+        let userId: string;
+        if (existingUser.length === 0) {
+          // Create new user if doesn't exist
+          const newUser = await this.db
+            .insert(users)
+            .values({
+              id: `user-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
+              username: user,
+              createdAt: new Date(timestamp),
+            })
+            .returning();
+
+          if (!newUser || newUser.length === 0) {
+            throw new Error('Failed to create user');
+          }
+
+          userId = newUser[0].id;
+        } else {
+          userId = existingUser[0].id;
+        }
+
+        // Ensure room exists in database
+        const existingRoom = await this.db.select().from(rooms).where(eq(rooms.id, roomId)).limit(1);
+
+        if (existingRoom.length === 0) {
+          // Create new room if doesn't exist
+          const newRoom = await this.db
+            .insert(rooms)
+            .values({
+              id: roomId,
+              name: `Room ${roomId}`,
+              createdAt: new Date(timestamp),
+              lastActivity: new Date(timestamp),
+            })
+            .returning();
+
+          if (!newRoom || newRoom.length === 0) {
+            throw new Error('Failed to create room');
+          }
+        }
+
+        // Store message in database
+        await this.db.insert(messages).values({
           id: messageId,
+          roomId,
+          userId,
+          content,
+          createdAt: new Date(timestamp),
+        });
+
+        const newMessage: WebSocketMessage = {
+          type: WS_MESSAGE_TYPES.MESSAGE,
+          content,
+          user,
           timestamp,
+          id: String(messageId),
         };
 
         this.messageQueue.push(newMessage);
@@ -431,12 +519,11 @@ export class WebSocketHibernationServer implements DurableObject {
         }
 
         // Update room activity
-        const roomId = this.state.id.toString();
         await this.updateRoomActivity(roomId);
       }
     } catch (error) {
       console.error('Error processing message:', error);
-      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
+      ws.send(JSON.stringify({ type: WS_MESSAGE_TYPES.ERROR, message: 'Invalid message format' }));
     }
   }
 
@@ -467,7 +554,7 @@ export class WebSocketHibernationServer implements DurableObject {
           } else {
             extendedWs.retryCount++;
             try {
-              ws.send(JSON.stringify({ type: 'ping' }));
+              ws.send(JSON.stringify({ type: WS_MESSAGE_TYPES.PING }));
             } catch (error) {
               console.error('Error sending ping:', error);
               ws.close(1000, 'Connection error');
@@ -475,6 +562,6 @@ export class WebSocketHibernationServer implements DurableObject {
           }
         }
       }
-    }, PING_INTERVAL) as unknown as number;
+    }, PING_INTERVAL) as unknown as ReturnType<typeof setTimeout>;
   }
 }

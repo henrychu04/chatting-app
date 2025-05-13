@@ -2,31 +2,28 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { createBrowserRouter, RouterProvider } from 'react-router-dom';
 import './index.css';
-import App from './App';
-import Room from './components/Room';
-import { SignupForm } from './components/SignupForm';
-import { LoginForm } from './components/LoginForm';
-import { UserProvider } from './contexts/UserContext';
+
+// Import route components
+import AppLayout from './routes';
+import Index from './routes/room';
+import Login from './routes/login';
+import Signup from './routes/signup';
 
 const router = createBrowserRouter([
   {
-    element: (
-      <UserProvider>
-        <App />
-      </UserProvider>
-    ),
+    element: <AppLayout />,
     children: [
       {
         path: '/',
-        element: <Room />,
+        element: <Index />,
       },
       {
         path: '/login',
-        element: <LoginForm />,
+        element: <Login />,
       },
       {
         path: '/signup',
-        element: <SignupForm />,
+        element: <Signup />,
       },
     ],
   },

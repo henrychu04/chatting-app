@@ -1,3 +1,7 @@
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS rooms;
+DROP TABLE IF EXISTS users;
+
 CREATE TABLE `messages` (
 	`id` text PRIMARY KEY NOT NULL,
 	`room_id` text NOT NULL,

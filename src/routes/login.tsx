@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { Input } from './ui/input';
-import { Button } from './ui/button';
-import { Card } from './ui/card';
-import { useUser } from '../contexts/UserContext';
+import { useAuth } from '../contexts/AuthContext';
+import { Card } from '../components/ui/card';
+import { Input } from '../components/ui/input';
+import { Button } from '../components/ui/button';
 
 interface LoginResponse {
   token: string;
@@ -17,13 +17,13 @@ interface LoginResponse {
   message?: string;
 }
 
-export function LoginForm() {
+export default function Login() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const navigate = useNavigate();
-  const { setUser, setAuthToken } = useUser();
+  const { setAuth } = useAuth();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -49,13 +49,8 @@ export function LoginForm() {
         throw new Error(data.message || 'Login failed');
       }
 
-      // Store auth token and user info
-      localStorage.setItem('authToken', data.token);
-      localStorage.setItem('user', JSON.stringify(data.user));
-
-      // Update context
-      setAuthToken(data.token);
-      setUser(data.user);
+      // Update auth context
+      setAuth(data.token, data.user.id, data.user.username);
 
       // Redirect to chat
       navigate('/');
@@ -74,7 +69,7 @@ export function LoginForm() {
           <p className="mt-2 text-sm text-gray-400">Sign in to your account</p>
         </div>
 
-        <form onSubmit={handleSubmit} className="mt-8 space-y-6">
+        <form onSubmit={handleSubmit} className="mt-8 space-y-6" autoComplete="on">
           {error && (
             <div className="p-3 text-sm text-red-400 bg-red-900/20 rounded-md border border-red-900/50">{error}</div>
           )}
@@ -93,6 +88,8 @@ export function LoginForm() {
                 onChange={(e) => setUsername(e.target.value)}
                 className="mt-1"
                 placeholder="Enter your username"
+                autoComplete="username"
+                aria-label="Username"
               />
             </div>
 
@@ -109,6 +106,8 @@ export function LoginForm() {
                 onChange={(e) => setPassword(e.target.value)}
                 className="mt-1"
                 placeholder="Enter your password"
+                autoComplete="current-password"
+                aria-label="Password"
               />
             </div>
           </div>

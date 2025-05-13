@@ -108,40 +108,55 @@ export class Auth {
     combined.set(saltArray);
     combined.set(hashArray, saltArray.length);
 
-    return btoa(String.fromCharCode(...combined));
+    // Use base64url encoding to avoid issues with special characters
+    return btoa(String.fromCharCode(...combined))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
   }
 
   static async verifyPassword(password: string, hash: string): Promise<boolean> {
-    const encoder = new TextEncoder();
-    const combined = new Uint8Array(
-      atob(hash)
-        .split('')
-        .map((c) => c.charCodeAt(0))
-    );
-    const salt = combined.slice(0, 16);
-    const storedHash = combined.slice(16);
+    try {
+      const encoder = new TextEncoder();
+      // Convert base64url back to base64
+      const base64Hash = hash
+        .replace(/-/g, '+')
+        .replace(/_/g, '/')
+        .padEnd(hash.length + ((4 - (hash.length % 4)) % 4), '=');
 
-    const key = await crypto.subtle.importKey(
-      'raw',
-      encoder.encode(password),
-      { name: 'PBKDF2', hash: 'SHA-256' },
-      false,
-      ['deriveBits']
-    );
+      const combined = new Uint8Array(
+        atob(base64Hash)
+          .split('')
+          .map((c) => c.charCodeAt(0))
+      );
+      const salt = combined.slice(0, 16);
+      const storedHash = combined.slice(16);
 
-    const newHash = await crypto.subtle.deriveBits(
-      {
-        name: 'PBKDF2',
-        salt,
-        iterations: 100000,
-        hash: 'SHA-256',
-      },
-      key,
-      256
-    );
+      const key = await crypto.subtle.importKey(
+        'raw',
+        encoder.encode(password),
+        { name: 'PBKDF2', hash: 'SHA-256' },
+        false,
+        ['deriveBits']
+      );
 
-    const newHashArray = new Uint8Array(newHash);
-    return this.compareArrays(newHashArray, storedHash);
+      const newHash = await crypto.subtle.deriveBits(
+        {
+          name: 'PBKDF2',
+          salt,
+          iterations: 100000,
+          hash: 'SHA-256',
+        },
+        key,
+        256
+      );
+
+      const newHashArray = new Uint8Array(newHash);
+      return this.compareArrays(newHashArray, storedHash);
+    } catch (error) {
+      console.error('Password verification error:', error);
+      return false;
+    }
   }
 
   private static compareArrays(a: Uint8Array, b: Uint8Array): boolean {
